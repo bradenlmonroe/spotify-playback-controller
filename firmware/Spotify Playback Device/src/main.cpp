@@ -69,6 +69,10 @@ void IRAM_ATTR encoderISR() {
 }
 
 // ---------- Button (interrupt + debounce) ----------
+// NOTE: on this encoder, SW shares the same internal "+" net as the RGB LED's
+// common anode. At rest, SW reads LOW; pressing the button pulls it toward
+// whatever voltage is on "+". So we use an internal pulldown and trigger on
+// RISING - the opposite of the usual pullup/FALLING button pattern.
 volatile bool    buttonFlagPressed = false;
 volatile uint32_t lastButtonISRTime = 0;
 
@@ -98,10 +102,14 @@ void setupLED() {
   ledcAttachPin(PIN_LED_B, LEDC_CH_B);
 }
 
+// This is a common-anode RGB LED (shared "+" pin), so each color pin turns
+// that color ON when pulled LOW, not HIGH. setColor() still takes normal
+// "brightness" values (0 = off, 255 = full on) - the inversion happens here
+// so the rest of the code doesn't have to think about it.
 void setColor(uint8_t r, uint8_t g, uint8_t b) {
-  ledcWrite(LEDC_CH_R, r);
-  ledcWrite(LEDC_CH_G, g);
-  ledcWrite(LEDC_CH_B, b);
+  ledcWrite(LEDC_CH_R, 255 - r);
+  ledcWrite(LEDC_CH_G, 255 - g);
+  ledcWrite(LEDC_CH_B, 255 - b);
 }
 
 // ---------- Setup ----------
@@ -113,15 +121,14 @@ void setup() {
   // pull-ups/filtering on the breakout; it just reinforces the idle-high level.
   pinMode(PIN_ENC_A, INPUT_PULLUP);
   pinMode(PIN_ENC_B, INPUT_PULLUP);
-  pinMode(PIN_BUTTON, INPUT_PULLUP);
+  pinMode(PIN_BUTTON, INPUT_PULLDOWN); // SW idles LOW, goes HIGH when pressed
 
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_A), encoderISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_B), encoderISR, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(PIN_BUTTON), buttonISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_BUTTON), buttonISR, RISING);
 
   setupLED();
   setColor(0, 0, 40); // dim blue = idle
-  
 
   Serial.println("Rotary encoder ready.");
 }
