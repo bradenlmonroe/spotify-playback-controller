@@ -1,129 +1,107 @@
 /*
- * ESP32-S3 + SparkFun Rotary Encoder Breakout (A/B quadrature, button, RGB LED)
+ * ESP32-S3 Rotary Encoder + Button + RGB LED
+ * SparkFun rotary encoder breakout (quadrature A/B, push button, RGB LED)
  *
- * WIRING (corrected — see note about GPIO6 conflict):
- *   Encoder A      -> GPIO 6
- *   Encoder B      -> GPIO 15
- *   Button         -> GPIO 8
- *   RGB Red        -> GPIO 4
- *   RGB Green      -> GPIO 5
- *   RGB Blue       -> GPIO 16
+ * Wiring:
+ *   Encoder A   -> GPIO 16
+ *   Encoder B   -> GPIO 15
+ *   Button      -> GPIO 8
+ *   LED R       -> GPIO 4
+ *   LED G       -> GPIO 5
+ *   LED B       -> GPIO 6
+ *   VCC         -> 3.3V (through your filtering caps)
+ *   GND         -> GND
  *
- * NOTE: Your original wiring had encoder pin A AND one RGB channel both on
- * GPIO 6. That's a conflict — pick one signal per pin. This code assumes
- * the table above. If you rewire differently, just update the #defines.
- *
- * Behavior:
- *   - Turning the knob increments/decrements a counter (quadrature decoded
- *     in an interrupt, so it won't miss steps even during fast spins).
- *   - Pressing the button toggles the RGB LED on/off.
- *   - While on, the RGB LED shows a hue that shifts based on the encoder
- *     position, just as a visual demo — swap fillColorFromPosition() for
- *     whatever behavior you actually want.
+ * Decoding uses a full quadrature state table (robust against
+ * contact bounce / partial detents) rather than naive edge counting.
  */
 
 #include <Arduino.h>
 
 // ---------- Pin definitions ----------
-#define PIN_ENC_A     6
-#define PIN_ENC_B     15
-#define PIN_BUTTON    8
-#define PIN_RGB_R     4
-#define PIN_RGB_G     5
-#define PIN_RGB_B     16
+static const uint8_t PIN_ENC_A  = 16;
+static const uint8_t PIN_ENC_B  = 15;
+static const uint8_t PIN_BUTTON = 8;
+static const uint8_t PIN_LED_R  = 4;
+static const uint8_t PIN_LED_G  = 5;
+static const uint8_t PIN_LED_B  = 6;
 
-// ---------- Encoder polarity / behavior ----------
-// If turning the knob counts the wrong direction, swap PIN_ENC_A/PIN_ENC_B
-// above (no code changes needed), or flip the sign in the ISR table below.
+// ---------- Quadrature state machine ----------
+// States
+#define R_START      0x0
+#define R_CW_FINAL   0x1
+#define R_CW_BEGIN   0x2
+#define R_CW_NEXT    0x3
+#define R_CCW_BEGIN  0x4
+#define R_CCW_FINAL  0x5
+#define R_CCW_NEXT   0x6
+// Direction flags OR'd into the returned state
+#define DIR_CW  0x10
+#define DIR_CCW 0x20
 
-// ---------- PWM (LEDC) config for RGB ----------
-#define PWM_FREQ        5000
-#define PWM_RESOLUTION  8      // 8-bit -> 0-255
-#define PWM_CH_R        0
-#define PWM_CH_G        1
-#define PWM_CH_B        2
-
-// If your RGB LED is COMMON ANODE, set this to true so 0=full brightness,
-// 255=off gets inverted correctly. Common cathode (most common) -> false.
-#define RGB_COMMON_ANODE false
-
-// ---------- Encoder state ----------
-volatile int32_t encoderPosition = 0;
-volatile uint8_t lastEncState = 0;
-
-// Quadrature transition table: index = (prevAB << 2) | currAB
-// Valid single-step transitions give +1 / -1, everything else (bounce /
-// double-step) gives 0 so we don't miscount.
-static const int8_t QEM[16] = {
-   0, -1,  1,  0,
-   1,  0,  0, -1,
-  -1,  0,  0,  1,
-   0,  1, -1,  0
+static const uint8_t stateTable[7][4] = {
+  /* R_START     */ {R_START,    R_CW_BEGIN,  R_CCW_BEGIN, R_START},
+  /* R_CW_FINAL  */ {R_CW_NEXT,  R_START,     R_CW_FINAL,  R_START | DIR_CW},
+  /* R_CW_BEGIN  */ {R_CW_NEXT,  R_CW_BEGIN,  R_START,     R_START},
+  /* R_CW_NEXT   */ {R_CW_NEXT,  R_CW_BEGIN,  R_CW_FINAL,  R_START},
+  /* R_CCW_BEGIN */ {R_CCW_NEXT, R_START,     R_CCW_BEGIN, R_START},
+  /* R_CCW_FINAL */ {R_CCW_NEXT, R_CCW_FINAL, R_START,     R_START | DIR_CCW},
+  /* R_CCW_NEXT  */ {R_CCW_NEXT, R_CCW_FINAL, R_CCW_BEGIN, R_START}
 };
+
+volatile uint8_t  encState        = R_START;
+volatile int32_t  encoderPosition = 0;
+volatile int8_t   encoderDirection = 0; // +1 CW, -1 CCW (last confirmed step)
 
 void IRAM_ATTR encoderISR() {
   uint8_t a = digitalRead(PIN_ENC_A);
   uint8_t b = digitalRead(PIN_ENC_B);
-  uint8_t currState = (a << 1) | b;
-  uint8_t index = (lastEncState << 2) | currState;
-  encoderPosition += QEM[index];
-  lastEncState = currState;
+  uint8_t pinState = (b << 1) | a;
+  encState = stateTable[encState & 0x0F][pinState];
+  uint8_t dir = encState & 0x30;
+  if (dir == DIR_CW) {
+    encoderPosition++;
+    encoderDirection = 1;
+  } else if (dir == DIR_CCW) {
+    encoderPosition--;
+    encoderDirection = -1;
+  }
 }
 
-// ---------- Button state (debounced) ----------
-volatile bool buttonFlagPressed = false;
-uint32_t lastButtonISRTime = 0;
-bool ledOn = false;
+// ---------- Button (interrupt + debounce) ----------
+volatile bool    buttonFlagPressed = false;
+volatile uint32_t lastButtonISRTime = 0;
 
 void IRAM_ATTR buttonISR() {
   uint32_t now = millis();
-  // simple debounce: ignore edges within 50ms of the last accepted one
-  if (now - lastButtonISRTime > 50) {
+  if (now - lastButtonISRTime > 30) { // 30ms debounce window
     buttonFlagPressed = true;
     lastButtonISRTime = now;
   }
 }
 
-// ---------- RGB helpers ----------
-void setRGB(uint8_t r, uint8_t g, uint8_t b) {
-  if (RGB_COMMON_ANODE) {
-    r = 255 - r;
-    g = 255 - g;
-    b = 255 - b;
-  }
-  ledcWrite(PWM_CH_R, r);
-  ledcWrite(PWM_CH_G, g);
-  ledcWrite(PWM_CH_B, b);
+// ---------- RGB LED (LEDC PWM) ----------
+// Your toolchain is on Arduino-ESP32 core 2.x, which uses the
+// channel-based LEDC API: ledcSetup(channel,...) + ledcAttachPin(pin,channel)
+// + ledcWrite(channel,duty). (Core 3.x replaced this with pin-based
+// ledcAttach()/ledcWrite(pin,...) — not what's installed here.)
+static const uint8_t LEDC_CH_R = 0;
+static const uint8_t LEDC_CH_G = 1;
+static const uint8_t LEDC_CH_B = 2;
+
+void setupLED() {
+  ledcSetup(LEDC_CH_R, 5000, 8); // 5 kHz, 8-bit duty
+  ledcSetup(LEDC_CH_G, 5000, 8);
+  ledcSetup(LEDC_CH_B, 5000, 8);
+  ledcAttachPin(PIN_LED_R, LEDC_CH_R);
+  ledcAttachPin(PIN_LED_G, LEDC_CH_G);
+  ledcAttachPin(PIN_LED_B, LEDC_CH_B);
 }
 
-// Simple HSV -> RGB, hue in [0,255]
-void hueToRGB(uint8_t hue, uint8_t &r, uint8_t &g, uint8_t &b) {
-  uint8_t region = hue / 43;
-  uint8_t remainder = (hue - (region * 43)) * 6;
-
-  uint8_t p = 0;
-  uint8_t q = 255 - remainder;
-  uint8_t t = remainder;
-
-  switch (region) {
-    case 0:  r = 255; g = t;   b = p;   break;
-    case 1:  r = q;   g = 255; b = p;   break;
-    case 2:  r = p;   g = 255; b = t;   break;
-    case 3:  r = p;   g = q;   b = 255; break;
-    case 4:  r = t;   g = p;   b = 255; break;
-    default: r = 255; g = p;   b = q;   break;
-  }
-}
-
-void updateLEDFromPosition() {
-  if (!ledOn) {
-    setRGB(0, 0, 0);
-    return;
-  }
-  uint8_t hue = (uint8_t)(encoderPosition & 0xFF); // wraps every 256 steps
-  uint8_t r, g, b;
-  hueToRGB(hue, r, g, b);
-  setRGB(r, g, b);
+void setColor(uint8_t r, uint8_t g, uint8_t b) {
+  ledcWrite(LEDC_CH_R, r);
+  ledcWrite(LEDC_CH_G, g);
+  ledcWrite(LEDC_CH_B, b);
 }
 
 // ---------- Setup ----------
@@ -131,51 +109,48 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
+  // INPUT_PULLUP is harmless even though you already have external
+  // pull-ups/filtering on the breakout; it just reinforces the idle-high level.
   pinMode(PIN_ENC_A, INPUT_PULLUP);
   pinMode(PIN_ENC_B, INPUT_PULLUP);
   pinMode(PIN_BUTTON, INPUT_PULLUP);
-
-  lastEncState = (digitalRead(PIN_ENC_A) << 1) | digitalRead(PIN_ENC_B);
 
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_A), encoderISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_B), encoderISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(PIN_BUTTON), buttonISR, FALLING);
 
-  ledcSetup(PWM_CH_R, PWM_FREQ, PWM_RESOLUTION);
-  ledcSetup(PWM_CH_G, PWM_FREQ, PWM_RESOLUTION);
-  ledcSetup(PWM_CH_B, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttachPin(PIN_RGB_R, PWM_CH_R);
-  ledcAttachPin(PIN_RGB_G, PWM_CH_G);
-  ledcAttachPin(PIN_RGB_B, PWM_CH_B);
+  setupLED();
+  setColor(0, 0, 40); // dim blue = idle
+  
 
-  setRGB(0, 0, 0); // start off
-
-  Serial.println("Rotary encoder + button + RGB ready.");
+  Serial.println("Rotary encoder ready.");
 }
 
 // ---------- Loop ----------
 int32_t lastReportedPosition = 0;
 
 void loop() {
-  // Handle button press (toggle LED on/off)
-  if (buttonFlagPressed) {
-    buttonFlagPressed = false;
-    ledOn = !ledOn;
-    updateLEDFromPosition();
-    Serial.printf("Button pressed. LED %s\n", ledOn ? "ON" : "OFF");
-  }
-
-  // Report + react to encoder movement
-  int32_t pos;
   noInterrupts();
-  pos = encoderPosition;
+  int32_t pos = encoderPosition;
+  int8_t  dir = encoderDirection;
   interrupts();
 
   if (pos != lastReportedPosition) {
+    Serial.printf("Position: %ld  (dir %s)\n", (long)pos, dir > 0 ? "CW" : "CCW");
     lastReportedPosition = pos;
-    Serial.printf("Encoder position: %ld\n", (long)pos);
-    updateLEDFromPosition();
+
+    if (dir > 0) {
+      setColor(0, 40, 0);  // green flash for CW
+    } else {
+      setColor(40, 0, 0);  // red flash for CCW
+    }
   }
 
-  delay(5); // small idle delay; all real work happens in ISRs above
+  if (buttonFlagPressed) {
+    buttonFlagPressed = false;
+    Serial.println("Button pressed!");
+    setColor(40, 40, 40); // white flash
+    delay(80);
+    setColor(0, 0, 40);   // back to idle
+  }
 }
