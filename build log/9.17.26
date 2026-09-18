@@ -21,9 +21,10 @@ A basic UI has been designed, as per the UI diagram in the Documentation folder.
 A basic README has been written, and is likely to be edited for better clarity at the end of the project.
 The rotary encoder works and the ESP fully tracks all input - rotational and button press. The RGB also works, denoting either the direction of rotation or button input.
 The screen works.  The tester file exists to make sure that there are no dead pixels and that the screen displays all colors.
+The screen emulates the basic UI we designed earlier.  Currently there is a default/fixed song display, but later this will pull live info from the Spotify developer API.
 
 To Do as of 9.17.26 19:00:
-Finish putting UI elements on screen and live updating as user interacts with encoder.
+Finish live updating as user interacts with encoder.
 
 Finish connecting encoder to Spotify playback controls.  A developer app has been created, but needs to be linked.
 
