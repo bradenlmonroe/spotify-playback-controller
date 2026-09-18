@@ -5,6 +5,8 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <JPEGDEC.h>
+#include "esp_heap_caps.h"
 #include "secrets.h"
 
 // Known-good wiring from screen_tester.cpp
@@ -41,6 +43,7 @@ struct PlaybackState {
     bool shuffle;
     bool liked;
     String uri;
+    String albumArtUrl;
 };
 
 PlaybackState playback = {
@@ -51,6 +54,7 @@ PlaybackState playback = {
     true,
     false,
     false,
+    "",
     ""
 };
 
@@ -65,6 +69,12 @@ uint32_t spotifyRefreshRequestedAt = 0;
 
 constexpr uint32_t SPOTIFY_POLL_INTERVAL = 2000;
 constexpr uint32_t SPOTIFY_COMMAND_REFRESH_DELAY = 350;
+
+bool albumArtNeedsUpdate = false;
+volatile bool albumArtTaskRunning = false;
+
+constexpr size_t ALBUM_URL_SIZE = 256;
+char pendingAlbumArtUrl[ALBUM_URL_SIZE] = "";
 
 
 // ---------- 480 x 320 layout ----------
@@ -115,9 +125,13 @@ void IRAM_ATTR buttonISR()
     }
 }
 
+void drawAlbumPlaceholder();
 void drawSongInfo();
 void drawControls();
 void resetProgressBar();
+bool downloadAndDrawAlbumArt(const String &url);
+void updateAlbumArt();
+void albumArtTask(void *parameter);
 
 // ---------- WiFi / Spotify ----------
 
@@ -212,6 +226,11 @@ String urlEncode(const String &value)
     return encoded;
 }
 
+bool spotifySuccess(int status)
+{
+    return status >= 200 && status < 300;
+}
+
 int spotifyRequest(const char *method, const String &url, String &response,
                    const String &body = "")
 {
@@ -240,12 +259,10 @@ int spotifyRequest(const char *method, const String &url, String &response,
             status = http.POST(body);
         }
         else {
+            // ESP32 HTTPClient does NOT add Content-Length when size == 0.
+            // Spotify expects a body length on these bodyless POST commands.
             http.addHeader("Content-Length", "0");
-            status = http.sendRequest(
-                "POST",
-                (uint8_t *)"",
-                0
-            );
+            status = http.sendRequest("POST");
         }
     }
     else if (strcmp(method, "PUT") == 0) {
@@ -254,23 +271,20 @@ int spotifyRequest(const char *method, const String &url, String &response,
             status = http.PUT(body);
         }
         else {
+            // Explicitly send Content-Length: 0 for pause/shuffle/etc.
             http.addHeader("Content-Length", "0");
-            status = http.sendRequest(
-                "PUT",
-                (uint8_t *)"",
-                0
-            );
+            status = http.sendRequest("PUT");
         }
     }
     else if (strcmp(method, "DELETE") == 0) {
+        http.addHeader("Content-Length", "0");
         status = http.sendRequest("DELETE");
     }
 
-    if (status > 0 && status != 204) {
+    // Avoid trying to drain an unknown-length/bodyless error response.
+    // Playback GETs and other JSON responses normally have a positive length.
+    if (status > 0 && http.getSize() > 0) {
         response = http.getString();
-    }
-    else {
-        response = "";
     }
 
     http.end();
@@ -302,12 +316,8 @@ bool spotifyNext()
         "POST", "https://api.spotify.com/v1/me/player/next", response);
 
     Serial.printf("Next: HTTP %d\n", status);
-
-    if (status != 204 && !response.isEmpty()) {
-        Serial.println(response);
-    }
-    if (status == 204) requestSpotifyStateRefresh();
-    return status == 204;
+    if (spotifySuccess(status)) requestSpotifyStateRefresh();
+    return spotifySuccess(status);
 }
 
 bool spotifyPrevious()
@@ -316,13 +326,9 @@ bool spotifyPrevious()
     int status = spotifyRequestWithRefresh(
         "POST", "https://api.spotify.com/v1/me/player/previous", response);
 
-    Serial.printf("Next: HTTP %d\n", status);
-
-    if (status != 204 && !response.isEmpty()) {
-        Serial.println(response);
-    }
-    if (status == 204) requestSpotifyStateRefresh();
-    return status == 204;
+    Serial.printf("Previous: HTTP %d\n", status);
+    if (spotifySuccess(status)) requestSpotifyStateRefresh();
+    return spotifySuccess(status);
 }
 
 bool spotifyPause()
@@ -331,19 +337,14 @@ bool spotifyPause()
     int status = spotifyRequestWithRefresh(
         "PUT", "https://api.spotify.com/v1/me/player/pause", response);
 
-    Serial.printf("Next: HTTP %d\n", status);
-
-    if (status != 204 && !response.isEmpty()) {
-        Serial.println(response);
-    }
-    if (status == 204) requestSpotifyStateRefresh();
-    return status == 204;
+    Serial.printf("Pause: HTTP %d\n", status);
+    if (spotifySuccess(status)) requestSpotifyStateRefresh();
+    return spotifySuccess(status);
 }
 
 bool spotifyPlay()
 {
     String response;
-
     int status = spotifyRequestWithRefresh(
         "PUT",
         "https://api.spotify.com/v1/me/player/play",
@@ -351,22 +352,9 @@ bool spotifyPlay()
         "{}"
     );
 
-    Serial.printf("Next: HTTP %d\n", status);
-
-    if (status != 204 && !response.isEmpty()) {
-        Serial.println(response);
-    }
-
-    if (status == 204) {
-        requestSpotifyStateRefresh();
-        return true;
-    }
-
-    if (!response.isEmpty()) {
-        Serial.println(response);
-    }
-
-    return false;
+    Serial.printf("Play: HTTP %d\n", status);
+    if (spotifySuccess(status)) requestSpotifyStateRefresh();
+    return spotifySuccess(status);
 }
 
 bool spotifySetShuffle(bool enabled)
@@ -378,8 +366,8 @@ bool spotifySetShuffle(bool enabled)
     int status = spotifyRequestWithRefresh("PUT", url, response);
     Serial.printf("Shuffle: HTTP %d\n", status);
 
-    if (status == 204) requestSpotifyStateRefresh();
-    return status == 204;
+    if (spotifySuccess(status)) requestSpotifyStateRefresh();
+    return spotifySuccess(status);
 }
 
 bool spotifyCheckLiked(const String &uri, bool &liked)
@@ -477,6 +465,28 @@ bool getSpotifyPlayback()
                            : item["artists"][0]["name"].as<String>();
     String newUri = item["uri"].isNull() ? "" : item["uri"].as<String>();
 
+    // Spotify returns album artwork in several sizes, widest first.
+    // Choose the smallest image that is still at least as large as our
+    // album-art box. This avoids downloading the 640x640 image unnecessarily.
+    String newAlbumArtUrl = "";
+    int bestAlbumWidth = 1000000;
+
+    JsonArray images = item["album"]["images"].as<JsonArray>();
+    for (JsonObject image : images) {
+        int width = image["width"] | 0;
+        String url = image["url"].as<String>();
+
+        if (!url.isEmpty() && width >= ALBUM_SIZE && width < bestAlbumWidth) {
+            bestAlbumWidth = width;
+            newAlbumArtUrl = url;
+        }
+    }
+
+    // Fallback to the first image if Spotify did not provide dimensions.
+    if (newAlbumArtUrl.isEmpty() && images.size() > 0) {
+        newAlbumArtUrl = images[0]["url"].as<String>();
+    }
+
     uint32_t newDuration = item["duration_ms"] | 0;
     uint32_t newProgress = doc["progress_ms"] | 0;
     bool newPlaying = doc["is_playing"] | false;
@@ -494,6 +504,7 @@ bool getSpotifyPlayback()
     playback.playing = newPlaying;
     playback.shuffle = newShuffle;
     playback.uri = newUri;
+    playback.albumArtUrl = newAlbumArtUrl;
     positionReceivedAt = millis();
 
     if (songChanged) {
@@ -509,7 +520,16 @@ bool getSpotifyPlayback()
         resetProgressBar();
         controlsChanged = true;
 
-        // Album artwork download can be added here later.
+        // Copy the URL while still on loopTask. The album-art FreeRTOS task
+        // never reads playback.albumArtUrl, avoiding cross-task Arduino String access.
+        strncpy(
+            pendingAlbumArtUrl,
+            playback.albumArtUrl.c_str(),
+            ALBUM_URL_SIZE - 1
+        );
+        pendingAlbumArtUrl[ALBUM_URL_SIZE - 1] = '\0';
+
+        albumArtNeedsUpdate = true;
     }
 
     if (controlsChanged) {
@@ -582,6 +602,393 @@ uint32_t getCurrentPosition()
 }
 
 // ---------- Album art ----------
+
+// JPEGDEC sends decoded RGB565 blocks through this callback.
+static int drawAlbumJpegBlock(JPEGDRAW *pDraw)
+{
+    int x = pDraw->x;
+    int y = pDraw->y;
+    int w = pDraw->iWidth;
+    int h = pDraw->iHeight;
+
+    // The decode origin is chosen so all decoded blocks should stay inside
+    // the 190x190 album-art region. Abort the decode if a block would escape.
+    if (x < ALBUM_X || y < ALBUM_Y ||
+        x + w > ALBUM_X + ALBUM_SIZE ||
+        y + h > ALBUM_Y + ALBUM_SIZE) {
+        Serial.printf(
+            "JPEG block out of bounds: x=%d y=%d w=%d h=%d\n",
+            x, y, w, h
+        );
+        return 0;
+    }
+
+    gfx->draw16bitRGBBitmap(
+        x,
+        y,
+        pDraw->pPixels,
+        w,
+        h
+    );
+
+    return 1;
+}
+
+bool downloadAndDrawAlbumArt(const String &url)
+{
+    Serial.println("=== ALBUM ART DOWNLOAD + DECODE ===");
+
+    if (url.isEmpty() || WiFi.status() != WL_CONNECTED) {
+        Serial.println("Invalid URL or WiFi disconnected");
+        return false;
+    }
+
+    Serial.printf("Free heap before: %u\n", ESP.getFreeHeap());
+    Serial.printf(
+        "Largest block before: %u\n",
+        heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)
+    );
+
+    Serial.println("URL:");
+    Serial.println(url);
+
+    // ---------- Download JPEG ----------
+    WiFiClientSecure client;
+    client.setInsecure();
+
+    HTTPClient http;
+    http.setReuse(false);
+    http.setTimeout(5000);
+
+    Serial.println("Starting http.begin...");
+
+    if (!http.begin(client, url)) {
+        Serial.println("http.begin FAILED");
+        return false;
+    }
+
+    Serial.println("http.begin OK");
+    Serial.println("Starting GET...");
+
+    int status = http.GET();
+
+    Serial.printf("GET returned: %d\n", status);
+    Serial.printf("Free heap after GET: %u\n", ESP.getFreeHeap());
+
+    if (status != 200) {
+        Serial.println("Album artwork GET failed");
+        http.end();
+        client.stop();
+        return false;
+    }
+
+    int contentLength = http.getSize();
+
+    Serial.printf("Content length: %d\n", contentLength);
+
+    constexpr int MAX_JPEG_BYTES = 80 * 1024;
+
+    if (contentLength <= 0 || contentLength > MAX_JPEG_BYTES) {
+        Serial.printf("Invalid/oversized JPEG: %d bytes\n", contentLength);
+        http.end();
+        client.stop();
+        return false;
+    }
+
+    uint8_t *jpegBuffer =
+        static_cast<uint8_t *>(
+            heap_caps_malloc(contentLength, MALLOC_CAP_8BIT)
+        );
+
+    if (jpegBuffer == nullptr) {
+        Serial.println("JPEG malloc FAILED");
+        http.end();
+        client.stop();
+        return false;
+    }
+
+    Serial.printf("Allocated %d bytes for JPEG\n", contentLength);
+    Serial.printf("Free heap after allocation: %u\n", ESP.getFreeHeap());
+
+    WiFiClient *stream = http.getStreamPtr();
+
+    int received = 0;
+    uint32_t lastDataTime = millis();
+
+    while (received < contentLength) {
+        int available = stream->available();
+
+        if (available > 0) {
+            int remaining = contentLength - received;
+            int toRead = min(available, remaining);
+
+            int count = stream->read(
+                jpegBuffer + received,
+                toRead
+            );
+
+            if (count > 0) {
+                received += count;
+                lastDataTime = millis();
+            }
+        }
+
+        if (millis() - lastDataTime > 5000) {
+            Serial.println("JPEG download timed out");
+            break;
+        }
+
+        delay(1);
+    }
+
+    Serial.printf(
+        "JPEG downloaded: %d/%d bytes\n",
+        received,
+        contentLength
+    );
+
+    // Release TLS/HTTP memory before starting JPEGDEC.
+    http.end();
+    client.stop();
+
+    Serial.println("HTTP closed");
+    Serial.printf("Free heap after HTTP close: %u\n", ESP.getFreeHeap());
+
+    if (received != contentLength) {
+        Serial.println("Incomplete JPEG download");
+        free(jpegBuffer);
+        return false;
+    }
+
+    if (received < 2 ||
+        jpegBuffer[0] != 0xFF ||
+        jpegBuffer[1] != 0xD8) {
+        Serial.println("Invalid JPEG header");
+        free(jpegBuffer);
+        return false;
+    }
+
+    Serial.println("Valid JPEG header");
+
+    // ---------- Decode JPEG ----------
+    // IMPORTANT: JPEGDEC contains a large JPEGIMAGE structure. Do not put it
+    // on this FreeRTOS task's stack. Allocate it from the heap instead.
+    Serial.printf(
+        "Stack high-water before JPEGDEC allocation: %u\n",
+        (unsigned)uxTaskGetStackHighWaterMark(nullptr)
+    );
+
+    JPEGDEC *jpeg =
+        static_cast<JPEGDEC *>(malloc(sizeof(JPEGDEC)));
+
+    if (jpeg == nullptr) {
+        Serial.println("JPEGDEC malloc FAILED");
+        free(jpegBuffer);
+        return false;
+    }
+
+    Serial.printf(
+        "JPEGDEC allocated on heap (%u bytes)\n",
+        (unsigned)sizeof(JPEGDEC)
+    );
+    Serial.printf(
+        "Free heap after JPEGDEC allocation: %u\n",
+        ESP.getFreeHeap()
+    );
+
+    Serial.println("Opening JPEG with JPEGDEC...");
+
+    if (!jpeg->openRAM(
+            jpegBuffer,
+            received,
+            drawAlbumJpegBlock
+        )) {
+        Serial.printf(
+            "JPEGDEC open failed: %d\n",
+            jpeg->getLastError()
+        );
+
+        free(jpeg);
+        free(jpegBuffer);
+        return false;
+    }
+
+    int sourceW = jpeg->getWidth();
+    int sourceH = jpeg->getHeight();
+
+    Serial.printf(
+        "JPEGDEC open OK: %d x %d\n",
+        sourceW,
+        sourceH
+    );
+
+    // JPEGDEC decode() takes OPTION BITS, not a numeric scale index.
+    // JPEG_SCALE_HALF == 2, JPEG_SCALE_QUARTER == 4, etc.
+    int scaleLevel = 0;
+
+    while (scaleLevel < 3 &&
+           ((sourceW >> scaleLevel) > ALBUM_SIZE ||
+            (sourceH >> scaleLevel) > ALBUM_SIZE)) {
+        scaleLevel++;
+    }
+
+    int decodeOptions = 0;
+
+    switch (scaleLevel) {
+        case 1:
+            decodeOptions = JPEG_SCALE_HALF;
+            break;
+
+        case 2:
+            decodeOptions = JPEG_SCALE_QUARTER;
+            break;
+
+        case 3:
+            decodeOptions = JPEG_SCALE_EIGHTH;
+            break;
+
+        default:
+            decodeOptions = 0;
+            break;
+    }
+
+    int decodedW = sourceW >> scaleLevel;
+    int decodedH = sourceH >> scaleLevel;
+
+    int drawX = ALBUM_X + (ALBUM_SIZE - decodedW) / 2;
+    int drawY = ALBUM_Y + (ALBUM_SIZE - decodedH) / 2;
+
+    Serial.printf(
+        "JPEG scale level=%d, options=0x%X, decoded=%d x %d, origin=(%d,%d)\n",
+        scaleLevel,
+        decodeOptions,
+        decodedW,
+        decodedH,
+        drawX,
+        drawY
+    );
+
+    gfx->fillRect(
+        ALBUM_X,
+        ALBUM_Y,
+        ALBUM_SIZE,
+        ALBUM_SIZE,
+        BLACK
+    );
+
+    Serial.println("Starting JPEG decode...");
+
+    int decodeResult = jpeg->decode(
+        drawX,
+        drawY,
+        decodeOptions
+    );
+
+    int jpegError = jpeg->getLastError();
+
+    jpeg->close();
+
+    Serial.printf(
+        "JPEG decode returned: %d, error: %d\n",
+        decodeResult,
+        jpegError
+    );
+
+    free(jpeg);
+    Serial.println("JPEGDEC heap object freed");
+
+    free(jpegBuffer);
+
+    Serial.println("JPEG buffer freed");
+    Serial.printf("Free heap after free: %u\n", ESP.getFreeHeap());
+
+    if (decodeResult == 0) {
+        Serial.println("JPEG decode FAILED");
+        return false;
+    }
+
+    gfx->drawRect(
+        ALBUM_X,
+        ALBUM_Y,
+        ALBUM_SIZE,
+        ALBUM_SIZE,
+        WHITE
+    );
+
+    Serial.println("Album artwork drawn successfully");
+    Serial.println("=== ALBUM ART COMPLETE ===");
+
+    return true;
+}
+
+
+
+void albumArtTask(void *parameter)
+{
+    Serial.println("Album art task started");
+    Serial.printf(
+        "Album task initial stack high-water: %u\n",
+        (unsigned)uxTaskGetStackHighWaterMark(nullptr)
+    );
+
+    // Make a task-local copy. From this point onward the task does not touch
+    // playback.albumArtUrl or any other dynamically allocated URL String.
+    char url[ALBUM_URL_SIZE];
+
+    strncpy(
+        url,
+        pendingAlbumArtUrl,
+        ALBUM_URL_SIZE - 1
+    );
+    url[ALBUM_URL_SIZE - 1] = '\0';
+
+    Serial.print("Task URL: ");
+    Serial.println(url);
+
+    if (strlen(url) > 0) {
+        if (!downloadAndDrawAlbumArt(String(url))) {
+            Serial.println("Album artwork failed; using placeholder");
+            drawAlbumPlaceholder();
+        }
+    } else {
+        Serial.println("No album artwork URL");
+        drawAlbumPlaceholder();
+    }
+
+    Serial.printf(
+        "Album task final stack high-water: %u\n",
+        (unsigned)uxTaskGetStackHighWaterMark(nullptr)
+    );
+    Serial.println("Album art task finished");
+
+    albumArtTaskRunning = false;
+    vTaskDelete(nullptr);
+}
+
+void updateAlbumArt()
+{
+    if (!albumArtNeedsUpdate || albumArtTaskRunning) {
+        return;
+    }
+
+    albumArtNeedsUpdate = false;
+    albumArtTaskRunning = true;
+
+    BaseType_t result = xTaskCreate(
+        albumArtTask,
+        "albumArt",
+        16384,       // dedicated 16 KB stack for TLS/HTTP work
+        nullptr,
+        1,
+        nullptr
+    );
+
+    if (result != pdPASS) {
+        Serial.println("Failed to create album art task");
+        albumArtTaskRunning = false;
+        albumArtNeedsUpdate = true;
+    }
+}
 
 void drawAlbumPlaceholder()
 {
@@ -884,6 +1291,11 @@ void updateEncoder()
         buttonFlagPressed = false;
         interrupts();
 
+        Serial.printf(
+            "encoder press -> activate control %d\n",
+            selectedControl
+        );
+
         activateSelectedControl();
     }
 }
@@ -1051,17 +1463,24 @@ void setup()
 
 void loop()
 {
-    // Poll continuously so encoder movement and button presses stay responsive.
-    updateEncoder();
+    // While albumArtTask is alive, it owns both networking and the TFT.
+    // Avoid encoder-triggered TFT writes, Spotify TLS requests, and progress
+    // drawing from loopTask until the artwork operation is finished.
+    if (albumArtTaskRunning) {
+        delay(1);
+        return;
+    }
 
-    // Keep playback state synchronized with Spotify without blocking the UI.
+    updateEncoder();
     updateSpotify();
 
-    // Update only the progress bar twice per second.
     static uint32_t lastProgressDraw = 0;
 
     if (millis() - lastProgressDraw >= 500) {
         lastProgressDraw = millis();
         drawProgressBar();
     }
+
+    // Starts only after updateSpotify() has fully returned.
+    updateAlbumArt();
 }

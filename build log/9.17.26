@@ -14,7 +14,7 @@ The encoder connects to certain GPIO pins with wire.  Passive components and bas
     RGB pins connect through wire as well.
 
 
-Completed as of 9.17.26 19:00:
+Completed as of 9.17.26 22:19:
 Everything is fully wired, as per the electrical diagram in the Documentation folder.  
 A basic case CAD file was designed in OnShape, and a copy exists in the hardware folder of this repository.
 A basic UI has been designed, as per the UI diagram in the Documentation folder.
@@ -26,8 +26,5 @@ The screen updates the UI according to encoder controls.  All playback control f
 The encoder now properly scrolls and interacts with proper UI.
 The ESP accesses the internet through private security keys, which I've put in the .gitignore to avoid putting personal info into this repository.
 The Spotify Developer app has been created.
-
-To Do as of 9.17.26 19:00:
-
-Post the right album cover to the display
+The screen updates the album art.
 
