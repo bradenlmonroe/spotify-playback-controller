@@ -20,11 +20,11 @@
 
 // ---------- Pin definitions ----------
 static const uint8_t PIN_ENC_A  = 16;
-static const uint8_t PIN_ENC_B  = 15;
-static const uint8_t PIN_BUTTON = 8;
-static const uint8_t PIN_LED_R  = 4;
-static const uint8_t PIN_LED_G  = 5;
-static const uint8_t PIN_LED_B  = 6;
+static const uint8_t PIN_ENC_B  = 17;
+static const uint8_t PIN_BUTTON = 39;
+static const uint8_t PIN_LED_R  = 42;
+static const uint8_t PIN_LED_G  = 40;
+static const uint8_t PIN_LED_B  = 41;
 
 // ---------- Quadrature state machine ----------
 // States

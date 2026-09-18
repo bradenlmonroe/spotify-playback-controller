@@ -9,6 +9,11 @@
 #define TFT_MOSI  7
 #define TFT_SCK   8
 
+// Rotary encoder wiring
+#define ENCODER_A    16
+#define ENCODER_B    17
+#define ENCODER_PUSH 39
+
 Arduino_DataBus *bus =
     new Arduino_HWSPI(TFT_DC, TFT_CS);
 
@@ -56,6 +61,41 @@ constexpr int BAR_X = 65;
 constexpr int BAR_Y = 285;
 constexpr int BAR_W = 350;
 constexpr int BAR_H = 4;
+
+// ---------- Encoder / control selection ----------
+
+enum ControlIndex {
+    CONTROL_SHUFFLE = 0,
+    CONTROL_PREVIOUS,
+    CONTROL_PLAY_PAUSE,
+    CONTROL_NEXT,
+    CONTROL_LIKE,
+    CONTROL_COUNT
+};
+
+int selectedControl = CONTROL_PLAY_PAUSE;
+
+// Set this to -1 if the knob moves opposite the direction you expect.
+constexpr int ENCODER_DIRECTION = 1;
+
+int8_t encoderAccumulator = 0;
+uint8_t previousEncoderState = 0;
+
+// The SparkFun encoder button is unusual: SW idles LOW and goes HIGH
+// when pressed, so use INPUT_PULLDOWN + a RISING-edge interrupt.
+volatile bool buttonFlagPressed = false;
+volatile uint32_t lastButtonISRTime = 0;
+constexpr uint32_t BUTTON_DEBOUNCE_MS = 30;
+
+void IRAM_ATTR buttonISR()
+{
+    uint32_t now = millis();
+
+    if (now - lastButtonISRTime > BUTTON_DEBOUNCE_MS) {
+        buttonFlagPressed = true;
+        lastButtonISRTime = now;
+    }
+}
 
 // ---------- Helpers ----------
 
@@ -250,9 +290,23 @@ void drawHeart(int x, int y, bool filled)
     }
 }
 
+void drawSelectionBox(int control, uint16_t color)
+{
+    const int boxY = 134;
+    const int boxH = 42;
+
+    const int boxX[CONTROL_COUNT] = {224, 274, 331, 379, 429};
+    const int boxW[CONTROL_COUNT] = {43, 40, 38, 40, 42};
+
+    gfx->drawRoundRect(boxX[control], boxY, boxW[control], boxH, 5, color);
+}
+
 void drawControls()
 {
     const int y = 140;
+
+    // Clear only the control area. This avoids redrawing the entire screen.
+    gfx->fillRect(220, 130, 255, 50, BLACK);
 
     drawShuffle(230, y, playback.shuffle);
     drawPrevious(280, y);
@@ -266,6 +320,107 @@ void drawControls()
 
     drawNext(385, y);
     drawHeart(435, y, playback.liked);
+
+    // Green outline shows which action the encoder button will activate.
+    drawSelectionBox(selectedControl, GREEN);
+}
+
+void moveSelection(int direction)
+{
+    int nextControl = selectedControl + direction;
+
+    // Clamp at the two ends instead of wrapping around.
+    nextControl = constrain(nextControl, 0, CONTROL_COUNT - 1);
+
+    if (nextControl == selectedControl) {
+        return;
+    }
+
+    // Erase only the old outline, then draw the new one.
+    drawSelectionBox(selectedControl, BLACK);
+    selectedControl = nextControl;
+    drawSelectionBox(selectedControl, GREEN);
+
+    Serial.printf("selected control %d\n", selectedControl);
+}
+
+void activateSelectedControl()
+{
+    switch (selectedControl) {
+        case CONTROL_SHUFFLE:
+            playback.shuffle = !playback.shuffle;
+            Serial.println(playback.shuffle ? "enabled shuffle" : "disabled shuffle");
+            drawControls();
+            break;
+
+        case CONTROL_PREVIOUS:
+            Serial.println("skipped backward");
+            break;
+
+        case CONTROL_PLAY_PAUSE:
+            if (playback.playing) {
+                // Freeze progress at its current position before pausing.
+                playback.progressMs = getCurrentPosition();
+                playback.playing = false;
+                Serial.println("paused playback");
+            }
+            else {
+                // Resume progress timing from the stored position.
+                positionReceivedAt = millis();
+                playback.playing = true;
+                Serial.println("resumed playback");
+            }
+            drawControls();
+            break;
+
+        case CONTROL_NEXT:
+            Serial.println("skipped forward");
+            break;
+
+        case CONTROL_LIKE:
+            playback.liked = !playback.liked;
+            Serial.println(playback.liked ? "liked song" : "unliked song");
+            drawControls();
+            break;
+    }
+}
+
+void updateEncoder()
+{
+    // Gray-code transition table. A full mechanical detent normally produces
+    // four valid transitions, so accumulate them before moving the UI.
+    static const int8_t transitionTable[16] = {
+         0, -1,  1,  0,
+         1,  0,  0, -1,
+        -1,  0,  0,  1,
+         0,  1, -1,  0
+    };
+
+    uint8_t currentState =
+        (digitalRead(ENCODER_A) << 1) | digitalRead(ENCODER_B);
+
+    uint8_t transition = (previousEncoderState << 2) | currentState;
+    encoderAccumulator += transitionTable[transition];
+    previousEncoderState = currentState;
+
+    if (encoderAccumulator >= 4) {
+        encoderAccumulator = 0;
+        moveSelection(ENCODER_DIRECTION);
+    }
+    else if (encoderAccumulator <= -4) {
+        encoderAccumulator = 0;
+        moveSelection(-ENCODER_DIRECTION);
+    }
+
+    // Consume the button flag set by the ISR. Keep the actual UI work
+    // outside the interrupt so Serial and display drawing remain safe.
+    if (buttonFlagPressed) {
+        noInterrupts();
+        buttonFlagPressed = false;
+        interrupts();
+
+        activateSelectedControl();
+    }
 }
 
 // ---------- Progress bar ----------
@@ -357,6 +512,22 @@ void setup()
 
     Serial.println("Starting Spotify UI");
 
+    pinMode(ENCODER_A, INPUT_PULLUP);
+    pinMode(ENCODER_B, INPUT_PULLUP);
+    pinMode(ENCODER_PUSH, INPUT_PULLDOWN);
+
+    previousEncoderState =
+        (digitalRead(ENCODER_A) << 1) | digitalRead(ENCODER_B);
+
+    attachInterrupt(
+        digitalPinToInterrupt(ENCODER_PUSH),
+        buttonISR,
+        RISING
+    );
+
+    Serial.println("Encoder initialized on A=16, B=17, PUSH=39");
+    Serial.println("Button initialized as INPUT_PULLDOWN / RISING interrupt");
+
     // Keep the same SPI initialization that worked in screen_tester.cpp.
     SPI.begin(TFT_SCK, -1, TFT_MOSI, -1);
 
@@ -386,6 +557,9 @@ void setup()
 
 void loop()
 {
+    // Poll continuously so encoder movement and button presses stay responsive.
+    updateEncoder();
+
     // Update only the progress bar twice per second.
     // Later, incoming Spotify data can update the PlaybackState structure.
     static uint32_t lastProgressDraw = 0;
